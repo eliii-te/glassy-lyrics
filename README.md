@@ -6,8 +6,14 @@ half-block characters (`█ ▀ ▄`), so ASCII, ß, Hangul, accents and emoji a
 look the same. Live word highlighting when Spotify provides word-level timing.
 
 ```
-glassy-lyrics 1.6.0 — synced Spotify lyrics as big terminal text
+glassy-lyrics 1.7.0 — synced Spotify lyrics as big terminal text
 ```
+
+glassy-lyrics is part of **GlassVibe**, which belongs to the **GlassTools**
+— the own tools of [GlassyOS](https://github.com/eliii-te) (GOS), my Linux
+distribution. GlassyOS is expected to release around the middle of next year.
+Until then, glassy-lyrics can be used completely standalone, without GlassyOS
+— it runs on any Linux with a Spotify client.
 
 ## ✨ Features
 
@@ -42,18 +48,21 @@ glassy-lyrics 1.6.0 — synced Spotify lyrics as big terminal text
 
 ### Option A — setup wizard (recommended)
 
-Run the self-contained `setup` file (it installs everything, verifies the
-install and then deletes itself):
+Grab the self-contained `setup` file and run it — it installs the tool plus
+all dependencies, verifies the install and then deletes itself:
 
 ```bash
 bash setup          # or: ./setup
 ```
 
-Afterwards open a new terminal and run:
+Afterwards open a new terminal and run the installed command:
 
 ```bash
 glassy-lyrics
 ```
+
+> The `setup` file is a self-extracting installer. You can build it yourself
+> from this repo with `./build-setup.sh`.
 
 ### Option B — manual
 
