@@ -1,0 +1,7 @@
+# Generated artifacts
+setup
+*.bak*
+
+# Python
+__pycache__/
+*.pyc
