@@ -1,19 +1,24 @@
 # glassy-lyrics 🎤
 
-Synced Spotify lyrics as **big, fullscreen terminal text** — karaoke style.
+Synced lyrics as **big, fullscreen terminal text** — karaoke style.
 Every word is rendered through Pillow into a bitmap and drawn with terminal
 half-block characters (`█ ▀ ▄`), so ASCII, ß, Hangul, accents and emoji all
-look the same. Live word highlighting when Spotify provides word-level timing.
+look the same. Live word highlighting when the source provides word-level
+timing.
+
+**Works with any media player** that exposes MPRIS over playerctl — not just
+Spotify. Spotify, VLC, mpv, Firefox/YouTube, Chromecast players, … if
+playerctl sees it, glassy-lyrics can display its lyrics.
 
 ```
-glassy-lyrics 1.7.0 — synced Spotify lyrics as big terminal text
+glassy-lyrics 1.7.0 — synced lyrics as big terminal text
 ```
 
 glassy-lyrics is part of **GlassVibe**, which belongs to the **GlassTools**
 — the own tools of [GlassyOS](https://github.com/eliii-te) (GOS), my Linux
 distribution. GlassyOS is expected to release around the middle of next year.
 Until then, glassy-lyrics can be used completely standalone, without GlassyOS
-— it runs on any Linux with a Spotify client.
+— it runs on any Linux.
 
 ## ✨ Features
 
@@ -21,7 +26,11 @@ Until then, glassy-lyrics can be used completely standalone, without GlassyOS
   No figlet, no broken accents, no missing Hangul.
 - **Live word-level karaoke** — from real word/syllable timing (Better Lyrics
   TTML / Spotify word-synced) instead of guessing; char-weighted interpolation
-  only as a last-resort fallback on line-level LRCs.
+  only as a last-resort fallback on line-level LRCs. For players without word-
+  level sources the tool falls back to line-level synced lyrics.
+- **Player-agnostic** — works with every playerctl/MPRIS player (Spotify,
+  VLC, mpv, Firefox/YouTube, …). Just set `GLASSY_LYRICS_PLAYER` if your
+  player isn't named `spotify`.
 - **5 lyric sources race in parallel**, word-level wins over line-level:
   1. Local override LRC files (`~/.config/glassy-lyrics/lrc/`)
   2. Spotify's own color-lyrics API (needs your `sp_dc` cookie — optional)
@@ -39,7 +48,8 @@ Until then, glassy-lyrics can be used completely standalone, without GlassyOS
 - Linux (any distro — Arch, Debian/Ubuntu, Fedora, …)
 - `python3` ≥ 3.8
 - `playerctl`
-- A running Spotify client (desktop app, or any playerctl-compatible player)
+- A running media player that exposes MPRIS (Spotify, VLC, mpv, Firefox, …)
+  — glassy-lyrics reads whatever playerctl sees
 - Fonts: one bold font from the search list (setup installs DejaVu + Noto CJK)
 - Pillow (`python3-pillow` / `python3-pil`), syncedlyrics optional
 - A terminal that supports ANSI + half-block characters (any modern one)
@@ -79,7 +89,7 @@ python3 -m pip install --user syncedlyrics
 
 ## 🎮 Usage
 
-Start Spotify, play something, then:
+Start playing something (Spotify by default, or any MPRIS player), then:
 
 ```bash
 glassy-lyrics
@@ -125,7 +135,8 @@ perfect when a remote LRC is incomplete.
 
 ### Word-level Spotify lyrics (optional)
 
-If you want Spotify's own synced lyrics (incl. per-word karaoke timing),
+Spotify is the only source with its own word-level timing. If you want
+Spotify's own synced lyrics (incl. per-word karaoke timing),
 place your `sp_dc` browser cookie in `~/.config/glassy-lyrics/sp_dc`:
 
 ```bash
@@ -157,15 +168,17 @@ to line-level LRCLIB.
 
 ## 🐛 Troubleshooting
 
-- **"No track playing"** — is Spotify running and `playerctl -p spotify status`
-  showing `Playing`? Other players can be targeted with `GLASSY_LYRICS_PLAYER`.
+- **"No track playing"** — is your player running and does
+  `playerctl -p spotify status` say `Playing`? Using a different player? Point
+  the tool at it with `GLASSY_LYRICS_PLAYER=vlc glassy-lyrics` (or mpv,
+  firefox, …).
 - **No lyrics shown** — try a well-known track; add a local LRC override or
   install `syncedlyrics` for the Musixmatch/NetEase fallback. Popular tracks
   get word-level karaoke via Better Lyrics; niche tracks usually only have
   line-level LRCLIB.
 - **Lyrics drift / feel late** — per-track fix via `offsets.json`, or globally
   with `GLASSY_LYRICS_OFFSET`. Make sure no other app is fighting over
-  playerctl (`playerctl -p spotify status` should say Playing).
+  playerctl (`playerctl status` should show exactly one `Playing` player).
 - **Plain text instead of big block letters** — no compatible font found;
   install a bold font (Noto CJK / DejaVu), see the list at the top of the file.
 
