@@ -56,23 +56,26 @@ Until then, glassy-lyrics can be used completely standalone, without GlassyOS
 
 ## 🚀 Install
 
-### Option A — setup wizard (recommended)
+### Option A — setup installer (recommended)
 
-Grab the self-contained `setup` file and run it — it installs the tool plus
-all dependencies, verifies the install and then deletes itself:
+**1. Download this folder** (all glassy-lyrics files): on GitHub click the
+ green `Code` button → *Download ZIP*, or grab the whole `glassy-lyrics`
+ folder. Extract it anywhere.
+
+**2. Run the `setup` file inside the folder** — it installs the tool plus
+all dependencies (python, Pillow, playerctl, fonts), adds it to your PATH,
+verifies the install and then deletes itself:
 
 ```bash
+cd glassy-lyrics
 bash setup          # or: ./setup
 ```
 
-Afterwards open a new terminal and run the installed command:
+**3. Open a new terminal and run the installed command:**
 
 ```bash
 glassy-lyrics
 ```
-
-> The `setup` file is a self-extracting installer. You can build it yourself
-> from this repo with `./build-setup.sh`.
 
 ### Option B — manual
 
@@ -184,13 +187,9 @@ to line-level LRCLIB.
 
 ## 🧰 Development
 
-Single-file tool, zero runtime deps beyond Pillow + playerctl.
-The distributable `setup` is built by concatenating `setup-template.sh` with
-the tool itself:
-
-```bash
-./build-setup.sh          # writes ./setup
-```
+Single-file tool, zero runtime deps beyond Pillow + playerctl. The repo
+itself is the distributable folder: `glassy-lyrics` is the tool, `setup`
+is the installer users run — keep both in sync when changing the tool.
 
 ## 📄 License
 

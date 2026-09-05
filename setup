@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 #
-# glassy-lyrics — setup wizard (self-extracting installer)
+# glassy-lyrics — setup installer
 #
-# This file is generated: setup-template.sh + glassy-lyrics payload.
-# It installs everything glassy-lyrics needs, puts the tool on your PATH,
-# verifies the install, and then DELETES ITSELF on success.
+# Installs the glassy-lyrics tool from THIS folder onto your system:
+#   1. checks/installs system dependencies (python, Pillow, playerctl, fonts)
+#   2. optional syncedlyrics fallback (Musixmatch/NetEase)
+#   3. copies glassy-lyrics to ~/.local/bin/glassy-lyrics
+#   4. adds ~/.local/bin to your PATH (if missing)
+#   5. verifies the install, prints next steps, then DELETES ITSELF
 #
-# Usage:  bash setup     (or:  ./setup)
+# Usage:  bash setup     (or:  ./setup)   — run from inside the folder
 # Flags:  -y / --yes     assume yes for all prompts (non-interactive)
 # Env:    SETUP_SKIP_SYSTEM=1   skip package-manager steps (dev/testing only)
 #
@@ -18,15 +21,15 @@ for a in "$@"; do
   case "$a" in
     -y|--yes) FLAG_YES=1 ;;
     -h|--help)
-      sed -n '2,11p' "$0"
+      sed -n '2,16p' "$0"
       exit 0 ;;
     *) echo "unknown option: $a (only -y/--yes is supported)" >&2; exit 2 ;;
   esac
 done
 
-# Resolve own path so extraction + self-delete work from any cwd.
 SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
-MARKER="__GLASSY_LYRICS_PAYLOAD_7f3a__"
+HERE="$(cd "$(dirname "$SELF_PATH")" && pwd)"
+TOOL_SRC="$HERE/glassy-lyrics"
 
 # ── colors (only when tty) ────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -63,7 +66,7 @@ banner() {
   ╚██████╔╝███████╗██║  ██║███████║███████║   ██║
    ╚═════╝ ╚══════╝╚═╝  ╚═╝╚══════╝╚══════╝   ╚═╝
 EOF
-  printf "  ${C_B}lyrics — setup wizard v%s${C_0}\n\n" "$VERSION"
+  printf "  ${C_B}lyrics — setup installer v%s${C_0}\n\n" "$VERSION"
 }
 
 # ── detection ─────────────────────────────────────────────────────────────
@@ -75,7 +78,6 @@ detect_pm() {
   fi
 }
 
-# PM package names for the four things we may need
 pm_pkgs() { # $1 = what (python|pillow|playerctl|fonts|pip)
   case "$PM:$1" in
     pacman:python)   echo "python" ;;
@@ -123,8 +125,6 @@ font_present() {
 has_pip() { python3 -m pip --version >/dev/null 2>&1; }
 has_pil() { python3 -c "import PIL" >/dev/null 2>&1; }
 
-# pip install --user; on PEP 668 distros (Arch/Debian 12+/Fedora 38+) retry
-# with --break-system-packages — this is a user-level tool, safe here.
 pip_user_install() {
   python3 -m pip install --user --quiet "$1" 2>/dev/null \
     || python3 -m pip install --user --quiet --break-system-packages "$1" 2>/dev/null \
@@ -134,23 +134,29 @@ pip_user_install() {
 # ── main ──────────────────────────────────────────────────────────────────
 main() {
   banner
-  echo "This wizard installs everything glassy-lyrics needs:"
-  echo "  • system packages (python, Pillow, playerctl, fonts)"
+  echo "This installer sets up glassy-lyrics from this folder:"
+  echo "  • system packages if missing (python, Pillow, playerctl, fonts)"
   echo "  • optional syncedlyrics fallback (Musixmatch/NetEase)"
-  echo "  • the glassy-lyrics tool itself  →  ~/.local/bin/glassy-lyrics"
+  echo "  • copies glassy-lyrics → ~/.local/bin/glassy-lyrics"
   echo "On success this file deletes itself."
   echo
 
-  # --- 1. OS sanity -------------------------------------------------------
+  # --- 0. sanity -----------------------------------------------------------
+  if [ ! -f "$TOOL_SRC" ]; then
+    fail "glassy-lyrics not found next to this installer."
+    echo "  Expected: $TOOL_SRC"
+    echo "  Make sure you run setup from inside the downloaded glassy-lyrics"
+    echo "  folder and that glassy-lyrics is in the same folder."
+    exit 1
+  fi
   if [ "$(uname -s)" != "Linux" ]; then
     fail "glassy-lyrics is built for Linux (playerctl-based)."
-    echo "  On macOS/BSD you would need to install playerctl yourself."
     exit 1
   fi
   detect_pm
   [ -n "$PM" ] && ok "package manager detected: $PM" || warn "no pacman/apt/dnf found — system packages must be installed manually"
 
-  # --- 2. system packages --------------------------------------------------
+  # --- 1. system packages --------------------------------------------------
   step "System dependencies"
   NEED=""
   command -v python3 >/dev/null 2>&1 || NEED="$NEED $(pm_pkgs python)"
@@ -165,7 +171,7 @@ main() {
       warn "  still missing:${NEED}"
     elif [ -z "$PM" ]; then
       fail "missing system packages, but no supported package manager found."
-      echo "  Please install manually, then re-run this wizard:"
+      echo "  Please install manually, then re-run this installer:"
       echo "    python3, Pillow, playerctl, a bold font (DejaVu or Noto CJK)"
       exit 1
     else
@@ -191,7 +197,7 @@ main() {
     ok "python3, Pillow, playerctl, fonts, pip — all present"
   fi
 
-  # --- 3. Pillow via pip fallback ------------------------------------------
+  # --- 2. Pillow via pip fallback ------------------------------------------
   if ! has_pil && has_pip; then
     step "Pillow (pip fallback)"
     if confirm "Install Pillow via pip --user?"; then
@@ -203,7 +209,7 @@ main() {
     fi
   fi
 
-  # --- 4. optional syncedlyrics fallback ------------------------------------
+  # --- 3. optional syncedlyrics fallback ------------------------------------
   if has_pip && ! python3 -c "import syncedlyrics" >/dev/null 2>&1; then
     step "Optional: syncedlyrics fallback"
     if confirm "Install syncedlyrics (extra lyric source: Musixmatch/NetEase)?"; then
@@ -215,30 +221,24 @@ main() {
     fi
   fi
 
-  # --- 5. install the tool ---------------------------------------------------
+  # --- 4. install the tool ---------------------------------------------------
   step "Installing glassy-lyrics"
   BIN_DIR="$HOME/.local/bin"
   CFG_DIR="$HOME/.config/glassy-lyrics"
   mkdir -p "$BIN_DIR" "$CFG_DIR/lrc"
 
   DEST="$BIN_DIR/glassy-lyrics"
-  awk -v m="$MARKER" 'index($0,m)==1{f=1;next} f' "$SELF_PATH" > "$DEST"
-  if [ ! -s "$DEST" ]; then
-    fail "internal error: payload not found in $SELF_PATH"
-    echo "  This looks like an unbuilt template. Run ./build-setup.sh first."
-    exit 1
-  fi
+  cp "$TOOL_SRC" "$DEST"
   chmod +x "$DEST"
   ok "installed to $DEST ($(wc -l < "$DEST") lines)"
 
-  # --- 6. PATH ----------------------------------------------------------------
+  # --- 5. PATH ----------------------------------------------------------------
   case ":$PATH:" in
     *":$BIN_DIR:"*) : ;;
     *)
-      RC=""
+      RC="$HOME/.bashrc"
       case "${SHELL:-/bin/bash}" in
-        *zsh) [ -f "$HOME/.zshrc" ] && RC="$HOME/.zshrc" || RC="$HOME/.zshrc" ;;
-        *)    [ -f "$HOME/.bashrc" ] && RC="$HOME/.bashrc" || RC="$HOME/.bashrc" ;;
+        *zsh) RC="$HOME/.zshrc" ;;
       esac
       if ! grep -qF "export PATH=\"\$HOME/.local/bin" "$RC" 2>/dev/null; then
         printf '\n# added by glassy-lyrics setup\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$RC"
@@ -248,26 +248,28 @@ main() {
       ;;
   esac
 
-  # --- 7. verify ----------------------------------------------------------------
+  # --- 6. verify ----------------------------------------------------------------
   step "Verification"
   if "$DEST" --version 2>/dev/null | grep -q "glassy-lyrics"; then
     ok "install verified: $("$DEST" --version 2>/dev/null)"
   else
     fail "verification failed — glassy-lyrics --version did not run"
-    echo "  Check that python3 and Pillow are installed, then re-run this wizard."
+    echo "  Check that python3 and Pillow are installed, then re-run this installer."
     exit 1
   fi
 
-  # --- 8. done, self-delete -----------------------------------------------------
+  # --- 7. done, self-delete -----------------------------------------------------
   cat <<EOF
 
 ${C_B}────────────────────────────────────────────────────────${C_0}
 ${C_G}Setup complete!${C_0} 🎤
-  • Start Spotify, play a track, then run:  ${C_B}glassy-lyrics${C_0}
-  • Config dir:       $CFG_DIR  (per-song offsets, LRC overrides)
-  • Optional word-level sync: put your Spotify sp_dc cookie into
+  • Play something (Spotify by default, or any MPRIS player), then run:
+                       ${C_B}glassy-lyrics${C_0}
+  • Other players:     GLASSY_LYRICS_PLAYER=vlc glassy-lyrics
+  • Config dir:        $CFG_DIR  (per-song offsets, LRC overrides)
+  • Optional word sync: put your Spotify sp_dc cookie into
                        $CFG_DIR/sp_dc
-  • Help:             glassy-lyrics --help
+  • Help:              glassy-lyrics --help
 ${C_B}────────────────────────────────────────────────────────${C_0}
 EOF
   rm -f -- "$SELF_PATH"
