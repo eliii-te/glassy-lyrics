@@ -1,0 +1,1147 @@
+#!/usr/bin/env python3
+"""
+glassy-lyrics — synced Spotify lyrics fullscreen, big-text mode.
+
+All text is rendered through Pillow into a bitmap and converted to terminal
+half-block characters — same style for ASCII, ß, Hangul, accents, emoji.
+Lyric fetching runs in parallel background threads; first hit wins.
+
+Sources (preferred order):
+  0. Local override at ~/.config/glassy-lyrics/lrc/<Artist> - <Title>.lrc
+     (use this when remote sources have incomplete LRCs; "/" → "_" in names).
+  1. Spotify's own API — needs sp_dc cookie at ~/.config/glassy-lyrics/sp_dc.
+     Some songs come back with LINE_AND_WORD_SYNCED → true word-level timing.
+     (Currently blocked by Spotify's TOTP auth since 2025-10-18.)
+  2. Better Lyrics API (lyrics-api.boidu.dev) — TTML with word/syllable timing,
+     same data quality Spicy Lyrics (Spicetify) shows. Free for cached tracks.
+  3. LRCLIB                                          — line-level only.
+  4. python-syncedlyrics (Musixmatch / NetEase)      — line-level fallback.
+
+Env vars:
+  GLASSY_LYRICS_OFFSET     seconds added to playback position (positive = earlier).
+  GLASSY_LYRICS_PLAYER     playerctl player name. Default "spotify".
+  GLASSY_LYRICS_FALLBACK   1 (default) = also try syncedlyrics; 0 = skip.
+  GLASSY_LYRICS_HEIGHT     big-text height in terminal rows. Default 8.
+  GLASSY_LYRICS_DEBUG      1 = keep stderr visible (don't send to /dev/null).
+  GLASSY_LYRICS_BOIDU_KEY  optional X-API-Key for Better Lyrics API (uncached
+                           tracks / rate-limit bypass).
+"""
+import sys, os, time, signal, subprocess, json, shutil, threading, tempfile
+import urllib.request, urllib.parse, re
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    HAVE_PIL = True
+except ImportError:
+    HAVE_PIL = False
+
+LRCLIB_URL = "https://lrclib.net/api/get"
+LRCLIB_SEARCH = "https://lrclib.net/api/search"
+BOIDU_URL = "https://lyrics-api.boidu.dev/getLyrics"
+SPOTIFY_TOKEN_URL = "https://open.spotify.com/get_access_token?reason=transport&productType=web_player"
+SPOTIFY_LYRICS_URL = "https://spclient.wg.spotify.com/color-lyrics/v2/track/{}?format=json&vocalRemoval=false&market=from_token"
+
+CONFIG_DIR = os.path.expanduser("~/.config/glassy-lyrics")
+SP_DC_FILE = os.path.join(CONFIG_DIR, "sp_dc")
+OFFSETS_FILE = os.path.join(CONFIG_DIR, "offsets.json")
+LRC_OVERRIDE_DIR = os.path.join(CONFIG_DIR, "lrc")
+
+VERSION = "1.7.0"
+
+PLAYER = os.environ.get("GLASSY_LYRICS_PLAYER", "spotify")
+OFFSET = float(os.environ.get("GLASSY_LYRICS_OFFSET", "0.0"))
+
+HELP_TEXT = f"""glassy-lyrics {VERSION} — synced Spotify lyrics as big terminal text
+
+Usage:
+  glassy-lyrics                 run the fullscreen lyrics display
+  glassy-lyrics --version       print version and exit
+  glassy-lyrics --help          show this help and exit
+
+Environment variables:
+  GLASSY_LYRICS_OFFSET    seconds added to playback position (positive = earlier)
+  GLASSY_LYRICS_PLAYER    playerctl player name (default: spotify)
+  GLASSY_LYRICS_FALLBACK  1 (default) = also try syncedlyrics; 0 = skip
+  GLASSY_LYRICS_HEIGHT    big-text height in terminal rows (default: 8)
+  GLASSY_LYRICS_DEBUG     1 = keep stderr visible (don't send to /dev/null)
+"""
+ENABLE_FALLBACK = os.environ.get("GLASSY_LYRICS_FALLBACK", "1") == "1"
+
+POLL_INTERVAL = 0.5
+RENDER_HZ = 30
+FETCH_TIMEOUT = 12.0
+RACE_TIMEOUT = 25.0
+BIG_HEIGHT_ROWS = int(os.environ.get("GLASSY_LYRICS_HEIGHT", "8"))
+
+WHITE = "\033[97m"
+DIM = "\033[2m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+HIDE = "\033[?25l"
+SHOW = "\033[?25h"
+HOME = "\033[H"
+RESET_ATTR = "\033[0m"
+# Reset attributes BEFORE erasing/clearing so any stuck state (e.g. underline
+# from a stray escape) doesn't bleed into the new render.
+ERASE_LINE = RESET_ATTR + "\033[K"
+CLEAR = RESET_ATTR + "\033[2J\033[H"
+
+PIL_FONTS_BOLD = [
+    # Arch / Noto CJK
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Black.ttc",
+    # Debian/Ubuntu Noto CJK
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Black.ttc",
+    # Fedora Noto CJK
+    "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Bold.ttc",
+    "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Black.ttc",
+    # DejaVu (Arch / Debian / Fedora paths)
+    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+    # Nerd Fonts / JetBrains
+    "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Bold.ttf",
+    "/usr/share/fonts/JetBrainsMonoNerdFont-Bold.ttf",
+]
+
+
+# ──────────────────────────────────────────
+# Pillow → block-art renderer
+# ──────────────────────────────────────────
+
+class BlockRenderer:
+    def __init__(self):
+        self.font_path = None
+        for fp in PIL_FONTS_BOLD:
+            if os.path.exists(fp):
+                self.font_path = fp
+                break
+        self._font_cache = {}
+        self.cache = {}
+
+    def _font(self, size):
+        if size not in self._font_cache:
+            self._font_cache[size] = ImageFont.truetype(self.font_path, size)
+        return self._font_cache[size]
+
+    def render(self, text, target_rows=8):
+        if not text or not self.font_path or not HAVE_PIL:
+            return [text]
+        key = (text, target_rows)
+        if key in self.cache:
+            return self.cache[key]
+        try:
+            target_px = target_rows * 2
+            font = self._font(int(target_px * 0.85))
+            bbox = font.getbbox(text)
+            text_h = bbox[3] - bbox[1]
+            w = bbox[2] - bbox[0] + 4
+            h = target_px
+            img = Image.new("L", (w, h), 0)
+            draw = ImageDraw.Draw(img)
+            draw.text(
+                (2 - bbox[0], (h - text_h) // 2 - bbox[1]),
+                text, font=font, fill=255,
+            )
+            px = img.load()
+            rows = []
+            for y in range(0, h, 2):
+                row = []
+                for x in range(w):
+                    top = px[x, y] > 128
+                    bot = px[x, y + 1] > 128 if y + 1 < h else False
+                    if top and bot:
+                        row.append("█")
+                    elif top:
+                        row.append("▀")
+                    elif bot:
+                        row.append("▄")
+                    else:
+                        row.append(" ")
+                rows.append("".join(row).rstrip())
+            # Strip leading empty rows
+            while rows and not rows[0].strip():
+                rows.pop(0)
+            while rows and not rows[-1].strip():
+                rows.pop()
+            result = rows or [text]
+        except Exception:
+            result = [text]
+        if len(self.cache) > 400:
+            self.cache.clear()
+        self.cache[key] = result
+        return result
+
+
+# ──────────────────────────────────────────
+# Width-aware helpers
+# ──────────────────────────────────────────
+
+def char_width(c):
+    o = ord(c)
+    if o < 0x20:
+        return 0
+    if (0x1100 <= o <= 0x115F or 0x2E80 <= o <= 0x303E or 0x3041 <= o <= 0x33FF
+            or 0x3400 <= o <= 0x4DBF or 0x4E00 <= o <= 0x9FFF
+            or 0xA000 <= o <= 0xA4CF or 0xAC00 <= o <= 0xD7A3
+            or 0xF900 <= o <= 0xFAFF or 0xFE30 <= o <= 0xFE4F
+            or 0xFF00 <= o <= 0xFF60 or 0xFFE0 <= o <= 0xFFE6
+            or 0x20000 <= o <= 0x2FFFD or 0x30000 <= o <= 0x3FFFD):
+        return 2
+    return 1
+
+
+def vis_width(s):
+    return sum(char_width(c) for c in s)
+
+
+def truncate_vis(s, max_w):
+    out, w = [], 0
+    for c in s:
+        cw = char_width(c)
+        if w + cw > max_w:
+            out.append("…")
+            return "".join(out)
+        out.append(c)
+        w += cw
+    return "".join(out)
+
+
+def center_pad(s, total_w):
+    w = vis_width(s)
+    if w >= total_w:
+        return s
+    left = (total_w - w) // 2
+    right = total_w - w - left
+    return " " * left + s + " " * right
+
+
+# ──────────────────────────────────────────
+# playerctl
+# ──────────────────────────────────────────
+
+def _playerctl(*args):
+    return subprocess.run(
+        ["playerctl", "-p", PLAYER, *args],
+        capture_output=True, text=True, timeout=2,
+    )
+
+
+def get_track():
+    try:
+        meta = _playerctl(
+            "metadata", "--format",
+            "{{title}}|||{{artist}}|||{{album}}|||{{mpris:length}}",
+        )
+        if meta.returncode != 0 or not meta.stdout.strip():
+            return None
+        parts = meta.stdout.strip().split("|||")
+        if len(parts) != 4:
+            return None
+        title, artist, album, length_us = parts
+        pos_raw = _playerctl("position").stdout.strip()
+        status = _playerctl("status").stdout.strip()
+        return {
+            "title": title,
+            "artist": artist,
+            "album": album,
+            "duration": float(length_us) / 1_000_000 if length_us else 0.0,
+            "position": float(pos_raw or 0.0),
+            "status": status,
+        }
+    except Exception:
+        return None
+
+
+# ──────────────────────────────────────────
+# Spotify lyrics (word-level when available)
+# ──────────────────────────────────────────
+
+class SpotifyLyrics:
+    """Fetches lyrics directly from Spotify's web-player API using the user's
+    sp_dc browser cookie. When the song returns LINE_AND_WORD_SYNCED, we get
+    real per-word timestamps."""
+
+    def __init__(self):
+        self.sp_dc = self._load()
+        self._token = None
+        self._token_expires = 0.0
+        self._lock = threading.Lock()
+        self._disabled = False  # set if Spotify rejects auth (TOTP/ToS block)
+
+    @staticmethod
+    def _load():
+        try:
+            with open(SP_DC_FILE) as f:
+                v = f.read().strip()
+                return v or None
+        except (FileNotFoundError, IOError):
+            return None
+
+    @property
+    def configured(self):
+        return bool(self.sp_dc)
+
+    def _refresh_token(self):
+        if not self.sp_dc or self._disabled:
+            return None
+        req = urllib.request.Request(
+            SPOTIFY_TOKEN_URL,
+            headers={
+                "Cookie": f"sp_dc={self.sp_dc}",
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) glassy-lyrics",
+                "App-Platform": "WebPlayer",
+                "Accept-Language": "en",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=8) as r:
+                data = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            # 400/403 = Spotify blocks third-party access (TOTP / ToS).
+            # Disable for this session to stop hammering their endpoint.
+            if e.code in (400, 403):
+                self._disabled = True
+            return None
+        except Exception:
+            return None
+        if not data or data.get("isAnonymous"):
+            return None
+        self._token = data.get("accessToken")
+        ms = data.get("accessTokenExpirationTimestampMs", 0)
+        self._token_expires = ms / 1000 if ms else time.time() + 1800
+        return self._token
+
+    def _token_now(self):
+        with self._lock:
+            if self._token and time.time() < self._token_expires - 60:
+                return self._token
+            return self._refresh_token()
+
+    @staticmethod
+    def _track_id(track):
+        # playerctl gives mpris:trackid like spotify:track:XYZ or /com/spotify/track/XYZ
+        try:
+            raw = subprocess.run(
+                ["playerctl", "-p", PLAYER, "metadata", "mpris:trackid"],
+                capture_output=True, text=True, timeout=2,
+            ).stdout.strip()
+            return raw.rsplit("/", 1)[-1].rsplit(":", 1)[-1] or None
+        except Exception:
+            return None
+
+    def fetch(self, track):
+        if not self.configured:
+            return None
+        tid = self._track_id(track)
+        if not tid:
+            return None
+        token = self._token_now()
+        if not token:
+            return None
+        url = SPOTIFY_LYRICS_URL.format(tid)
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "App-Platform": "WebPlayer",
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=8) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                with self._lock:
+                    self._token = None
+                token = self._token_now()
+                if not token:
+                    return None
+                req.add_header("Authorization", f"Bearer {token}")
+                try:
+                    with urllib.request.urlopen(req, timeout=8) as r:
+                        return json.loads(r.read())
+                except Exception:
+                    return None
+            return None
+        except Exception:
+            return None
+
+
+def parse_spotify_response(data):
+    """Convert Spotify lyrics JSON into our internal format:
+    list of (line_ts, line_text, [(word_ts, word), ...])"""
+    lyrics = (data or {}).get("lyrics") or {}
+    sync_type = lyrics.get("syncType", "")
+    if sync_type == "UNSYNCED":
+        return None
+    raw_lines = lyrics.get("lines") or []
+    out = []
+    for line in raw_lines:
+        try:
+            ts = int(line.get("startTimeMs") or 0) / 1000.0
+        except Exception:
+            continue
+        text = (line.get("words") or "").strip()
+        if not text or text == "♪":
+            out.append((ts, "", []))
+            continue
+        word_timings = []
+        syllables = line.get("syllables") or []
+        if syllables and sync_type == "LINE_AND_WORD_SYNCED":
+            words = text.split()
+            # Prefix-sum of syllable char positions so we can find the syllable
+            # active at a given char position in O(1).
+            syl_starts = [0]
+            for s in syllables:
+                syl_starts.append(syl_starts[-1] + int(s.get("numChars", 1)))
+            char_pos = 0
+            syl_idx = 0
+            for word in words:
+                while syl_idx + 1 < len(syllables) and syl_starts[syl_idx + 1] <= char_pos:
+                    syl_idx += 1
+                try:
+                    wt = int(syllables[syl_idx]["startTimeMs"]) / 1000.0
+                except Exception:
+                    wt = ts
+                word_timings.append((wt, word))
+                char_pos += len(word) + 1
+        out.append((ts, text, word_timings))
+    out.sort(key=lambda x: x[0])
+    # Drop fully empty list
+    if not any(t for _, t, _ in out):
+        return None
+    return out
+
+
+# ──────────────────────────────────────────
+# TTML (Better Lyrics API) — word/syllable-level timing
+# ──────────────────────────────────────────
+
+_TT_NS = re.compile(r"\s+xmlns(?::\w+)?=\"[^\"]*\"")
+_TT_TAG = re.compile(r"(</?)([\w.-]+):([\w.-]+)")
+_TT_ATTR = re.compile(r"\s+([\w.-]+):([\w.-]+)=\"")
+
+
+def _strip_ttml_ns(xml_text):
+    """Strip XML namespace declarations and prefixes (tags AND attributes) so
+    ElementTree can parse Apple-style TTML without namespace gymnastics."""
+    xml_text = _TT_NS.sub("", xml_text)
+    xml_text = _TT_TAG.sub(lambda m: m.group(1) + m.group(3), xml_text)
+    xml_text = _TT_ATTR.sub(lambda m: f" {m.group(2)}=\"", xml_text)
+    return xml_text
+
+
+def _tt_time(v):
+    """TTML timestamps: '18.234' (seconds) or '00:00:18.234' or '3:53.713'."""
+    if v is None:
+        return None
+    v = v.strip()
+    if not v:
+        return None
+    try:
+        parts = v.split(":")
+        if len(parts) == 3:
+            h, m, s = parts
+            return int(h) * 3600 + int(m) * 60 + float(s)
+        if len(parts) == 2:
+            m, s = parts
+            return int(m) * 60 + float(s)
+        return float(v)
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_ttml(xml_text):
+    """Parse Apple-style TTML (as served by the Better Lyrics API / used by
+    Spicy Lyrics & friends) into our internal format:
+    list of (line_ts, line_text, [(word_ts, word), ...]).
+    Handles both itunes:timing="Word" (every <span> is a word) and
+    itunes:timing="Syllable" (group consecutive syllables into words).
+    Falls back to <p begin> line times when no word spans exist."""
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(_strip_ttml_ns(xml_text))
+    except Exception:
+        return None
+    timing = (root.get("timing") or "Word").lower()
+    out = []
+    try:
+        for p in root.iter("p"):
+            p_ts = _tt_time(p.get("begin"))
+            if p_ts is None:
+                continue
+            spans = []
+            for sp in p.iter("span"):
+                wts = _tt_time(sp.get("begin"))
+                text = "".join(sp.itertext())  # keep raw: syllable mode needs
+                                                 # trailing spaces as word delimiters
+                if wts is not None and text.strip():
+                    spans.append((wts, text))
+            if not spans:
+                body = "".join(p.itertext()).strip()
+                if body:
+                    out.append((p_ts, body, []))
+                continue
+            if timing == "syllable":
+                # group syllables into words: a word boundary is a space that
+                # ends a syllable's text (Apple puts the trailing space on the
+                # last syllable of each word)
+                words = []
+                cur = ""
+                cur_ts = None
+                for wts, text in spans:
+                    if cur_ts is None:
+                        cur_ts = wts
+                    cur += text
+                    while " " in cur:
+                        idx = cur.index(" ")
+                        piece = cur[:idx]
+                        if piece:
+                            words.append((cur_ts, piece))
+                        cur = cur[idx + 1:]
+                        cur_ts = None
+                if cur.strip():
+                    words.append((cur_ts or spans[-1][0], cur.strip()))
+            else:
+                words = [(ts, t.strip()) for ts, t in spans]
+            words = [(ts, w) for ts, w in words if w]
+            if not words:
+                continue
+            line_text = " ".join(w for _, w in words)
+            out.append((p_ts, line_text, words))
+    except Exception:
+        return None
+    out.sort(key=lambda x: x[0])
+    if not any(t for _, t, _ in out):
+        return None
+    return out
+
+
+def _try_boidu(track, found, result):
+    """Better Lyrics API (lyrics-api.boidu.dev) — the same TTML word/syllable
+    dataset Spicy Lyrics (Spicetify) renders. Public, free for cached tracks;
+    optional X-API-Key via GLASSY_LYRICS_BOIDU_KEY for uncached queries."""
+    time.sleep(0.05)
+    if found.is_set():
+        return
+    try:
+        params = urllib.parse.urlencode({
+            "s": track["title"],
+            "a": track["artist"],
+            "al": track["album"],
+            "d": int(track["duration"]),
+        })
+        headers = {"User-Agent": f"glassy-lyrics/{VERSION}"}
+        key = os.environ.get("GLASSY_LYRICS_BOIDU_KEY", "").strip()
+        if key:
+            headers["X-API-Key"] = key
+        req = urllib.request.Request(f"{BOIDU_URL}?{params}", headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read())
+        ttml = (data or {}).get("ttml")
+        if ttml and not found.is_set():
+            parsed = parse_ttml(ttml)
+            if parsed:
+                result["v"] = ("parsed", parsed)
+                found.set()
+    except Exception:
+        pass
+
+
+# ──────────────────────────────────────────
+# Lyric fetching — parallel race
+# ──────────────────────────────────────────
+
+def _http_json(url, timeout):
+    req = urllib.request.Request(url, headers={"User-Agent": f"glassy-lyrics/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def _try_spotify(track, spotify, found, result):
+    if not spotify.configured or spotify._disabled:
+        return
+    data = spotify.fetch(track)
+    parsed = parse_spotify_response(data) if data else None
+    if parsed and not found.is_set():
+        result["v"] = ("parsed", parsed)
+        found.set()
+
+
+def _try_lrclib_exact(track, found, result):
+    if found.is_set():
+        return
+    try:
+        params = urllib.parse.urlencode({
+            "artist_name": track["artist"], "track_name": track["title"],
+            "album_name": track["album"], "duration": int(track["duration"]),
+        })
+        data = _http_json(f"{LRCLIB_URL}?{params}", FETCH_TIMEOUT)
+        if data.get("syncedLyrics") and not found.is_set():
+            result["v"] = ("lrc", data["syncedLyrics"])
+            found.set()
+    except Exception:
+        pass
+
+
+def _try_lrclib_search(track, found, result):
+    time.sleep(0.2)
+    if found.is_set():
+        return
+    try:
+        params = urllib.parse.urlencode({"q": f"{track['title']} {track['artist']}"})
+        results = _http_json(f"{LRCLIB_SEARCH}?{params}", FETCH_TIMEOUT)
+        for item in results:
+            if item.get("syncedLyrics") and not found.is_set():
+                result["v"] = ("lrc", item["syncedLyrics"])
+                found.set()
+                return
+    except Exception:
+        pass
+
+
+_SYNCEDLYRICS_RUNNER = (
+    "import sys, syncedlyrics\n"
+    "lang = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else None\n"
+    "kw = {'providers': ['Musixmatch', 'Lrclib', 'NetEase']}\n"
+    "if lang: kw['lang'] = lang\n"
+    "r = syncedlyrics.search(sys.argv[1], **kw) or ''\n"
+    "open(sys.argv[2], 'w', encoding='utf-8').write(r)\n"
+)
+
+
+def _try_syncedlyrics(track, found, result, lang=None):
+    """Run syncedlyrics in a subprocess so its noisy print() statements never
+    leak into our terminal rendering. `lang` is forwarded if set per-song."""
+    time.sleep(2.0)
+    if found.is_set():
+        return
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix="glassy-lyrics-", suffix=".lrc")
+    os.close(tmp_fd)
+    try:
+        # Use sys.executable, NOT "python3": the interpreter that runs this
+        # script may be a pyenv/venv python where syncedlyrics is installed,
+        # while the system python3 has no access to it.
+        subprocess.run(
+            [sys.executable, "-c", _SYNCEDLYRICS_RUNNER,
+             f"{track['title']} {track['artist']}", tmp_path, lang or ""],
+            capture_output=True, timeout=30,
+        )
+        with open(tmp_path, encoding="utf-8") as f:
+            content = f.read()
+        if content.strip() and not found.is_set():
+            result["v"] = ("lrc", content)
+            found.set()
+    except Exception:
+        pass
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+
+
+def _load_local_override(track):
+    """Return raw LRC text from ~/.config/glassy-lyrics/lrc/, or None.
+    Matches '<Artist> - <Title>.lrc' (case-insensitive, "/" → "_")."""
+    if not os.path.isdir(LRC_OVERRIDE_DIR):
+        return None
+    safe = lambda s: s.replace("/", "_").strip()
+    target = f"{safe(track['artist'])} - {safe(track['title'])}.lrc".lower()
+    try:
+        for name in os.listdir(LRC_OVERRIDE_DIR):
+            if name.lower() == target:
+                with open(os.path.join(LRC_OVERRIDE_DIR, name), encoding="utf-8") as f:
+                    return f.read()
+    except OSError:
+        pass
+    return None
+
+
+def fetch_lyrics_race(track, spotify, lang=None):
+    """Fetch lyrics with word-level sources prioritized over line-level ones.
+
+    Phase 1 starts the word-level sources (Spotify, Better Lyrics/TTML) and
+    gives them a short head start. Phase 2 (line-level: LRCLIB, syncedlyrics)
+    only starts if no word-level hit arrived — so a precise TTML karaoke track
+    always wins over a guessed line-level one."""
+    local = _load_local_override(track)
+    if local and local.strip():
+        return parse_lrc(local)
+    found = threading.Event()
+    result = {"v": None}
+
+    def start(worker):
+        threading.Thread(target=worker, daemon=True).start()
+
+    # Phase 1 — word-level sources get a head start
+    if spotify.configured:
+        start(lambda: _try_spotify(track, spotify, found, result))
+    start(lambda: _try_boidu(track, found, result))
+
+    if not found.wait(timeout=1.2):
+        # Phase 2 — line-level fallbacks
+        start(lambda: _try_lrclib_exact(track, found, result))
+        start(lambda: _try_lrclib_search(track, found, result))
+        if ENABLE_FALLBACK:
+            start(lambda: _try_syncedlyrics(track, found, result, lang))
+        found.wait(timeout=max(1.0, RACE_TIMEOUT - 1.2))
+
+    if not result["v"]:
+        return None
+    kind, data = result["v"]
+    if kind == "parsed":
+        return data
+    return parse_lrc(data)
+
+
+_TS_RE = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
+
+
+def parse_lrc(text):
+    """Parse standard LRC into our 3-tuple format. Word timings stay empty
+    since LRCLIB-style lyrics are line-level only."""
+    lines = []
+    for raw in text.splitlines():
+        stamps = _TS_RE.findall(raw)
+        if not stamps:
+            continue
+        body = _TS_RE.sub("", raw).strip()
+        for mins, secs in stamps:
+            ts = int(mins) * 60 + float(secs)
+            lines.append((ts, body, []))
+    lines.sort(key=lambda x: x[0])
+    seen, out = set(), []
+    for ts, body, wt in lines:
+        key = (round(ts, 2), body)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((ts, body, wt))
+    return out
+
+
+class LyricsCache:
+    def __init__(self, spotify):
+        self._lock = threading.Lock()
+        self._cache = {}
+        self._inflight = set()
+        self._spotify = spotify
+
+    def request(self, track, lang=None):
+        key = (track["artist"], track["title"])
+        with self._lock:
+            if key in self._cache or key in self._inflight:
+                return
+            self._inflight.add(key)
+        threading.Thread(target=self._worker, args=(dict(track), key, lang), daemon=True).start()
+
+    def _worker(self, track, key, lang):
+        try:
+            r = fetch_lyrics_race(track, self._spotify, lang=lang)
+        except Exception:
+            r = None
+        with self._lock:
+            self._cache[key] = r if r else "MISSING"
+            self._inflight.discard(key)
+
+    def get(self, track):
+        key = (track["artist"], track["title"])
+        with self._lock:
+            v = self._cache.get(key)
+            if v == "MISSING":
+                return None, "missing"
+            if v is None:
+                return None, "loading"
+            return v, "ok"
+
+
+# ──────────────────────────────────────────
+# Word lookup
+# ──────────────────────────────────────────
+
+def load_song_config(track):
+    """Look up per-song config from ~/.config/glassy-lyrics/offsets.json.
+    Returns dict with optional keys: 'offset' (float seconds), 'lang' (e.g. 'ko').
+    Keys are 'Artist|Title' (case-insensitive). Value can be a number (offset
+    shorthand) or an object with 'offset'/'lang' fields."""
+    try:
+        with open(OFFSETS_FILE) as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"offset": 0.0, "lang": None}
+    key = f"{track['artist']}|{track['title']}".lower()
+    for k, v in data.items():
+        if k.lower() != key:
+            continue
+        if isinstance(v, (int, float)):
+            return {"offset": float(v), "lang": None}
+        if isinstance(v, dict):
+            return {
+                "offset": float(v.get("offset", 0.0) or 0.0),
+                "lang": v.get("lang"),
+            }
+    return {"offset": 0.0, "lang": None}
+
+
+def find_word(lines, position, extra_offset=0.0):
+    """Real word-level lookup when timings are present (Spotify), char-weighted
+    interpolation otherwise (LRCLIB)."""
+    pos = position + OFFSET + extra_offset
+    if not lines:
+        return "", "", -1
+    idx = -1
+    for i, entry in enumerate(lines):
+        if entry[0] <= pos:
+            idx = i
+        else:
+            break
+    if idx < 0:
+        return "", "", -1
+    line_start, line_text, word_timings = lines[idx]
+    line_end = lines[idx + 1][0] if idx + 1 < len(lines) else line_start + 4.0
+    if not line_text:
+        return "", "", idx
+
+    if word_timings:
+        # Line is active but the first word's timestamp lies in the future
+        # (Spotify syllable timing can start later than line_start) — nothing
+        # has been sung yet, so don't prematurely highlight the first word.
+        if pos < word_timings[0][0]:
+            return "", "", idx
+        chosen = word_timings[0][1]
+        for wts, w in word_timings:
+            if wts <= pos:
+                chosen = w
+            else:
+                break
+        word_clean = re.sub(r"[^\w'’-]", "", chosen, flags=re.UNICODE)
+        return line_text, word_clean, idx
+
+    # Fallback: char-weighted interpolation
+    words = line_text.split()
+    if not words:
+        return line_text, "", idx
+    line_dur = max(0.4, line_end - line_start)
+    elapsed = max(0.0, pos - line_start)
+    weights = [max(1, len(w)) for w in words]
+    total = sum(weights)
+    char_budget = elapsed * (total / line_dur)
+    cumulative = 0
+    word_idx = len(words) - 1
+    for i, weight in enumerate(weights):
+        cumulative += weight
+        if cumulative > char_budget:
+            word_idx = i
+            break
+    word = words[word_idx]
+    word_clean = re.sub(r"[^\w'’-]", "", word, flags=re.UNICODE)
+    return line_text, word_clean, idx
+
+
+# ──────────────────────────────────────────
+# Position tracking — background poller, lock-free reader
+# ──────────────────────────────────────────
+
+class TrackState:
+    """Polls playerctl in a background thread so the render loop never blocks
+    on subprocess calls. Position is extrapolated using a monotonic clock."""
+
+    def __init__(self):
+        self._track = None
+        self._mono = 0.0
+        self._pos = 0.0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        def loop():
+            while not self._stop.is_set():
+                t = get_track()
+                now = time.monotonic()
+                with self._lock:
+                    if t:
+                        # Clamp small backward jumps from Spotify's noisy reporting
+                        if (self._track and self._track.get("status") == "Playing"
+                                and t.get("status") == "Playing"
+                                and (t["artist"], t["title"]) == (self._track["artist"], self._track["title"])):
+                            extrapolated = self._pos + (now - self._mono)
+                            if t["position"] < extrapolated and extrapolated - t["position"] < 0.6:
+                                t["position"] = extrapolated
+                        self._track = t
+                        self._mono = now
+                        self._pos = t["position"]
+                    else:
+                        self._track = None
+                self._stop.wait(POLL_INTERVAL)
+        self._thread = threading.Thread(target=loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def current(self):
+        with self._lock:
+            if not self._track:
+                return None
+            t = dict(self._track)
+            mono = self._mono
+            pos = self._pos
+            status = t.get("status")
+        if status == "Playing":
+            t["position"] = pos + (time.monotonic() - mono)
+        else:
+            t["position"] = pos
+        return t
+
+
+# ──────────────────────────────────────────
+# Big-word renderer (auto-pick figlet vs blocks)
+# ──────────────────────────────────────────
+
+class BigWord:
+    def __init__(self):
+        self.blocks = BlockRenderer() if HAVE_PIL else None
+        self._cache = {}
+
+    def _render_at(self, word, target_rows):
+        if not (self.blocks and self.blocks.font_path):
+            return [word]
+        return self.blocks.render(word.upper(), target_rows=target_rows) or [word]
+
+    def lines(self, word, max_w):
+        if not word:
+            return [""]
+        key = (word, max_w)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        result = self._render_fitted(word, max_w)
+        if len(self._cache) > 300:
+            self._cache.clear()
+        self._cache[key] = result
+        return result
+
+    def _render_fitted(self, word, max_w):
+        """Try rendering at default height; if too wide, shrink down to a
+        minimum, and if it STILL overflows, split the word across multiple
+        rows of block-art stacked on top of each other."""
+        if not (self.blocks and self.blocks.font_path):
+            return [word]
+        # 1. Try default height + smaller heights until it fits horizontally
+        for rows in range(BIG_HEIGHT_ROWS, 3, -1):
+            r = self._render_at(word, rows)
+            if not r:
+                break
+            if max(len(line) for line in r) <= max_w:
+                return r
+        # 2. Doesn't fit even at minimum size — split into chunks that do fit.
+        #    Greedy: estimate, verify actual rendered width, shrink if overflow.
+        full = self._render_at(word, BIG_HEIGHT_ROWS) or [word]
+        full_w = max(len(line) for line in full) if full else 1
+        char_w = max(1.0, full_w / max(1, len(word)))
+        output = []
+        remaining = word
+        first = True
+        while remaining:
+            n = min(len(remaining), max(1, int(max_w / char_w)))
+            chunk_lines = self._render_at(remaining[:n], BIG_HEIGHT_ROWS) or [remaining[:n]]
+            while n > 1 and max(len(line) for line in chunk_lines) > max_w:
+                n -= 1
+                chunk_lines = self._render_at(remaining[:n], BIG_HEIGHT_ROWS) or [remaining[:n]]
+            if not first:
+                output.append("")
+            output.extend(chunk_lines)
+            remaining = remaining[n:]
+            first = False
+        return output
+
+    def prewarm(self, lyrics, max_w):
+        """Pre-render every unique word in the lyrics in a background thread.
+        Pillow rendering is fast (~5ms/word) but caching avoids any glitch
+        on the first time a word is shown during playback."""
+        if not lyrics or not (self.blocks and self.blocks.font_path):
+            return
+        words = set()
+        for entry in lyrics:
+            line = entry[1] if len(entry) > 1 else ""
+            for w in line.split():
+                clean = re.sub(r"[^\w'’-]", "", w, flags=re.UNICODE)
+                if clean:
+                    words.add(clean.upper())
+        def warm():
+            for w in words:
+                self.lines(w, max_w)
+        threading.Thread(target=warm, daemon=True).start()
+
+
+# ──────────────────────────────────────────
+# Frame rendering — diff-aware, no flicker
+# ──────────────────────────────────────────
+
+def fmt_time(s):
+    s = max(0, int(s))
+    return f"{s // 60}:{s % 60:02d}"
+
+
+def progress_bar(pos, dur, w):
+    if dur <= 0:
+        return ""
+    frac = max(0.0, min(1.0, pos / dur))
+    fill = int(frac * w)
+    return "▰" * fill + "▱" * (w - fill)
+
+
+class Frame:
+    def __init__(self, big):
+        self.big = big
+        self.last_word = None
+        self.last_footer = None
+        self.last_size = (0, 0)
+        self.big_geom = None  # (top_row, num_rows)
+
+    def render(self, word, footer, term_w, term_h):
+        out = []
+        size_changed = (term_w, term_h) != self.last_size
+        if size_changed:
+            out.append(CLEAR)
+            self.last_size = (term_w, term_h)
+            self.last_word = self.last_footer = None
+            self.big_geom = None
+
+        if word != self.last_word or size_changed:
+            big_lines = self.big.lines(word, term_w)
+            big_h = len(big_lines)
+            if self.big_geom:
+                ptop, prows = self.big_geom
+                for r in range(ptop, ptop + prows):
+                    out.append(f"\x1b[{r};1H{ERASE_LINE}")
+            # Vertical center, leaving 1 row for the footer at the bottom
+            top = max(2, (term_h - big_h - 1) // 2)
+            for i, ln in enumerate(big_lines):
+                out.append(f"\x1b[{top + i};1H{ERASE_LINE}{BOLD}{WHITE}{center_pad(ln, term_w)}{RESET}")
+            self.big_geom = (top, big_h)
+
+        if footer != self.last_footer or size_changed:
+            out.append(f"\x1b[{term_h};1H{ERASE_LINE}{DIM}{center_pad(truncate_vis(footer, term_w - 4), term_w)}{RESET}")
+            self.last_footer = footer
+
+        self.last_word = word
+        if out:
+            out.append(HOME)
+            sys.stdout.write("".join(out))
+            sys.stdout.flush()
+
+
+# ──────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────
+
+_RUNNING = True
+
+
+def cleanup(*_):
+    global _RUNNING
+    _RUNNING = False
+    sys.stdout.write(SHOW + CLEAR)
+    sys.stdout.flush()
+
+
+def _silence_stderr():
+    """Send everything that any code (Python, libs, subprocesses) writes to
+    stderr/fd 2 to /dev/null so it can never corrupt the rendered display.
+    Set GLASSY_LYRICS_DEBUG=1 to keep stderr visible for debugging."""
+    if os.environ.get("GLASSY_LYRICS_DEBUG") == "1":
+        return
+    try:
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull_fd, 2)
+        os.close(devnull_fd)
+        sys.stderr = open(os.devnull, "w", buffering=1)
+    except Exception:
+        pass
+
+
+def main():
+    args = sys.argv[1:]
+    if "--version" in args or "-V" in args:
+        print(f"glassy-lyrics {VERSION}")
+        sys.exit(0)
+    if "--help" in args or "-h" in args:
+        print(HELP_TEXT)
+        sys.exit(0)
+    _silence_stderr()
+    sys.stdout.write(HIDE + CLEAR)
+    sys.stdout.flush()
+    signal.signal(signal.SIGINT, lambda *a: (cleanup(), sys.exit(0)))
+    signal.signal(signal.SIGTERM, lambda *a: (cleanup(), sys.exit(0)))
+
+    state = TrackState()
+    state.start()
+    spotify = SpotifyLyrics()
+    cache = LyricsCache(spotify)
+    big = BigWord()
+    frame = Frame(big)
+
+    last_track_id = None
+    last_lyrics_state = None
+    song_offset = 0.0
+    song_lang = None
+
+    try:
+        while _RUNNING:
+            term = shutil.get_terminal_size((80, 24))
+            tw, th = term.columns, term.lines
+            track = state.current()
+
+            if not track:
+                frame.render("",
+                             "No track playing — playerctl: no active player",
+                             tw, th)
+                time.sleep(0.3)
+                continue
+
+            tid = (track["artist"], track["title"])
+            if tid != last_track_id:
+                last_track_id = tid
+                last_lyrics_state = None
+                cfg = load_song_config(track)
+                song_offset = cfg["offset"]
+                song_lang = cfg["lang"]
+                cache.request(track, lang=song_lang)
+
+            lyrics, status = cache.get(track)
+            if status != last_lyrics_state:
+                last_lyrics_state = status
+                if status == "ok" and lyrics:
+                    big.prewarm(lyrics, tw)
+
+            bar = progress_bar(track["position"], track["duration"], 24)
+            time_part = f"{fmt_time(track['position'])} / {fmt_time(track['duration'])}"
+            track_label = f"{track['artist']} — {track['title']}"
+
+            if status == "loading":
+                footer = f"{track_label}    Loading lyrics …    {bar}  {time_part}"
+                frame.render("", footer, tw, th)
+            elif status == "missing":
+                footer = f"{track_label}    No synced lyrics found    {bar}  {time_part}"
+                frame.render("", footer, tw, th)
+            else:
+                _, word, _ = find_word(lyrics, track["position"], extra_offset=song_offset)
+                offset_marker = f"  Δ{song_offset:+.1f}s" if song_offset else ""
+                footer = f"{track_label}    {bar}  {time_part}{offset_marker}"
+                frame.render(word, footer, tw, th)
+
+            time.sleep(1.0 / RENDER_HZ)
+    finally:
+        state.stop()
+        cleanup()
+
+
+if __name__ == "__main__":
+    main()
