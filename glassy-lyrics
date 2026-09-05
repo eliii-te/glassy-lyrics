@@ -12,8 +12,10 @@ Sources (preferred order):
   1. Spotify's own API — needs sp_dc cookie at ~/.config/glassy-lyrics/sp_dc.
      Some songs come back with LINE_AND_WORD_SYNCED → true word-level timing.
      (Currently blocked by Spotify's TOTP auth since 2025-10-18.)
-  2. LRCLIB                                          — line-level only.
-  3. python-syncedlyrics (Musixmatch / NetEase)      — line-level fallback.
+  2. Better Lyrics API (lyrics-api.boidu.dev) — TTML with word/syllable timing,
+     same data quality Spicy Lyrics (Spicetify) shows. Free for cached tracks.
+  3. LRCLIB                                          — line-level only.
+  4. python-syncedlyrics (Musixmatch / NetEase)      — line-level fallback.
 
 Env vars:
   GLASSY_LYRICS_OFFSET     seconds added to playback position (positive = earlier).
@@ -21,6 +23,8 @@ Env vars:
   GLASSY_LYRICS_FALLBACK   1 (default) = also try syncedlyrics; 0 = skip.
   GLASSY_LYRICS_HEIGHT     big-text height in terminal rows. Default 8.
   GLASSY_LYRICS_DEBUG      1 = keep stderr visible (don't send to /dev/null).
+  GLASSY_LYRICS_BOIDU_KEY  optional X-API-Key for Better Lyrics API (uncached
+                           tracks / rate-limit bypass).
 """
 import sys, os, time, signal, subprocess, json, shutil, threading, tempfile
 import urllib.request, urllib.parse, re
@@ -33,6 +37,7 @@ except ImportError:
 
 LRCLIB_URL = "https://lrclib.net/api/get"
 LRCLIB_SEARCH = "https://lrclib.net/api/search"
+BOIDU_URL = "https://lyrics-api.boidu.dev/getLyrics"
 SPOTIFY_TOKEN_URL = "https://open.spotify.com/get_access_token?reason=transport&productType=web_player"
 SPOTIFY_LYRICS_URL = "https://spclient.wg.spotify.com/color-lyrics/v2/track/{}?format=json&vocalRemoval=false&market=from_token"
 
@@ -41,7 +46,7 @@ SP_DC_FILE = os.path.join(CONFIG_DIR, "sp_dc")
 OFFSETS_FILE = os.path.join(CONFIG_DIR, "offsets.json")
 LRC_OVERRIDE_DIR = os.path.join(CONFIG_DIR, "lrc")
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 
 PLAYER = os.environ.get("GLASSY_LYRICS_PLAYER", "spotify")
 OFFSET = float(os.environ.get("GLASSY_LYRICS_OFFSET", "0.0"))
@@ -413,6 +418,141 @@ def parse_spotify_response(data):
 
 
 # ──────────────────────────────────────────
+# TTML (Better Lyrics API) — word/syllable-level timing
+# ──────────────────────────────────────────
+
+_TT_NS = re.compile(r"\s+xmlns(?::\w+)?=\"[^\"]*\"")
+_TT_TAG = re.compile(r"(</?)([\w.-]+):([\w.-]+)")
+_TT_ATTR = re.compile(r"\s+([\w.-]+):([\w.-]+)=\"")
+
+
+def _strip_ttml_ns(xml_text):
+    """Strip XML namespace declarations and prefixes (tags AND attributes) so
+    ElementTree can parse Apple-style TTML without namespace gymnastics."""
+    xml_text = _TT_NS.sub("", xml_text)
+    xml_text = _TT_TAG.sub(lambda m: m.group(1) + m.group(3), xml_text)
+    xml_text = _TT_ATTR.sub(lambda m: f" {m.group(2)}=\"", xml_text)
+    return xml_text
+
+
+def _tt_time(v):
+    """TTML timestamps: '18.234' (seconds) or '00:00:18.234' or '3:53.713'."""
+    if v is None:
+        return None
+    v = v.strip()
+    if not v:
+        return None
+    try:
+        parts = v.split(":")
+        if len(parts) == 3:
+            h, m, s = parts
+            return int(h) * 3600 + int(m) * 60 + float(s)
+        if len(parts) == 2:
+            m, s = parts
+            return int(m) * 60 + float(s)
+        return float(v)
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_ttml(xml_text):
+    """Parse Apple-style TTML (as served by the Better Lyrics API / used by
+    Spicy Lyrics & friends) into our internal format:
+    list of (line_ts, line_text, [(word_ts, word), ...]).
+    Handles both itunes:timing="Word" (every <span> is a word) and
+    itunes:timing="Syllable" (group consecutive syllables into words).
+    Falls back to <p begin> line times when no word spans exist."""
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(_strip_ttml_ns(xml_text))
+    except Exception:
+        return None
+    timing = (root.get("timing") or "Word").lower()
+    out = []
+    try:
+        for p in root.iter("p"):
+            p_ts = _tt_time(p.get("begin"))
+            if p_ts is None:
+                continue
+            spans = []
+            for sp in p.iter("span"):
+                wts = _tt_time(sp.get("begin"))
+                text = "".join(sp.itertext())  # keep raw: syllable mode needs
+                                                 # trailing spaces as word delimiters
+                if wts is not None and text.strip():
+                    spans.append((wts, text))
+            if not spans:
+                body = "".join(p.itertext()).strip()
+                if body:
+                    out.append((p_ts, body, []))
+                continue
+            if timing == "syllable":
+                # group syllables into words: a word boundary is a space that
+                # ends a syllable's text (Apple puts the trailing space on the
+                # last syllable of each word)
+                words = []
+                cur = ""
+                cur_ts = None
+                for wts, text in spans:
+                    if cur_ts is None:
+                        cur_ts = wts
+                    cur += text
+                    while " " in cur:
+                        idx = cur.index(" ")
+                        piece = cur[:idx]
+                        if piece:
+                            words.append((cur_ts, piece))
+                        cur = cur[idx + 1:]
+                        cur_ts = None
+                if cur.strip():
+                    words.append((cur_ts or spans[-1][0], cur.strip()))
+            else:
+                words = [(ts, t.strip()) for ts, t in spans]
+            words = [(ts, w) for ts, w in words if w]
+            if not words:
+                continue
+            line_text = " ".join(w for _, w in words)
+            out.append((p_ts, line_text, words))
+    except Exception:
+        return None
+    out.sort(key=lambda x: x[0])
+    if not any(t for _, t, _ in out):
+        return None
+    return out
+
+
+def _try_boidu(track, found, result):
+    """Better Lyrics API (lyrics-api.boidu.dev) — the same TTML word/syllable
+    dataset Spicy Lyrics (Spicetify) renders. Public, free for cached tracks;
+    optional X-API-Key via GLASSY_LYRICS_BOIDU_KEY for uncached queries."""
+    time.sleep(0.05)
+    if found.is_set():
+        return
+    try:
+        params = urllib.parse.urlencode({
+            "s": track["title"],
+            "a": track["artist"],
+            "al": track["album"],
+            "d": int(track["duration"]),
+        })
+        headers = {"User-Agent": f"glassy-lyrics/{VERSION}"}
+        key = os.environ.get("GLASSY_LYRICS_BOIDU_KEY", "").strip()
+        if key:
+            headers["X-API-Key"] = key
+        req = urllib.request.Request(f"{BOIDU_URL}?{params}", headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read())
+        ttml = (data or {}).get("ttml")
+        if ttml and not found.is_set():
+            parsed = parse_ttml(ttml)
+            if parsed:
+                result["v"] = ("parsed", parsed)
+                found.set()
+    except Exception:
+        pass
+
+
+# ──────────────────────────────────────────
 # Lyric fetching — parallel race
 # ──────────────────────────────────────────
 
@@ -523,23 +663,34 @@ def _load_local_override(track):
 
 
 def fetch_lyrics_race(track, spotify, lang=None):
+    """Fetch lyrics with word-level sources prioritized over line-level ones.
+
+    Phase 1 starts the word-level sources (Spotify, Better Lyrics/TTML) and
+    gives them a short head start. Phase 2 (line-level: LRCLIB, syncedlyrics)
+    only starts if no word-level hit arrived — so a precise TTML karaoke track
+    always wins over a guessed line-level one."""
     local = _load_local_override(track)
     if local and local.strip():
         return parse_lrc(local)
     found = threading.Event()
     result = {"v": None}
-    workers = []
+
+    def start(worker):
+        threading.Thread(target=worker, daemon=True).start()
+
+    # Phase 1 — word-level sources get a head start
     if spotify.configured:
-        workers.append(threading.Thread(target=_try_spotify, args=(track, spotify, found, result), daemon=True))
-    workers += [
-        threading.Thread(target=_try_lrclib_exact, args=(track, found, result), daemon=True),
-        threading.Thread(target=_try_lrclib_search, args=(track, found, result), daemon=True),
-    ]
-    if ENABLE_FALLBACK:
-        workers.append(threading.Thread(target=_try_syncedlyrics, args=(track, found, result, lang), daemon=True))
-    for w in workers:
-        w.start()
-    found.wait(timeout=RACE_TIMEOUT)
+        start(lambda: _try_spotify(track, spotify, found, result))
+    start(lambda: _try_boidu(track, found, result))
+
+    if not found.wait(timeout=1.2):
+        # Phase 2 — line-level fallbacks
+        start(lambda: _try_lrclib_exact(track, found, result))
+        start(lambda: _try_lrclib_search(track, found, result))
+        if ENABLE_FALLBACK:
+            start(lambda: _try_syncedlyrics(track, found, result, lang))
+        found.wait(timeout=max(1.0, RACE_TIMEOUT - 1.2))
+
     if not result["v"]:
         return None
     kind, data = result["v"]

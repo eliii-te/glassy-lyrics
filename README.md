@@ -13,13 +13,16 @@ glassy-lyrics 1.6.0 — synced Spotify lyrics as big terminal text
 
 - **Big text, rendered properly** — Pillow → bitmap → half-block characters.
   No figlet, no broken accents, no missing Hangul.
-- **Live word-level karaoke** when Spotify returns `LINE_AND_WORD_SYNCED`
-  (real per-word timestamps); char-weighted interpolation otherwise.
-- **4 lyric sources race in parallel**, first hit wins:
+- **Live word-level karaoke** — from real word/syllable timing (Better Lyrics
+  TTML / Spotify word-synced) instead of guessing; char-weighted interpolation
+  only as a last-resort fallback on line-level LRCs.
+- **5 lyric sources race in parallel**, word-level wins over line-level:
   1. Local override LRC files (`~/.config/glassy-lyrics/lrc/`)
   2. Spotify's own color-lyrics API (needs your `sp_dc` cookie — optional)
-  3. LRCLIB (line-level)
-  4. python-syncedlyrics (Musixmatch / NetEase) — optional fallback
+  3. **Better Lyrics API** — TTML with word/syllable timing, the same dataset
+     Spicy Lyrics (Spicetify) renders
+  4. LRCLIB (line-level)
+  5. python-syncedlyrics (Musixmatch / NetEase) — optional fallback
 - **Flicker-free** diff-aware rendering at 30 Hz; background poller with
   monotonic-clock position extrapolation so the UI never blocks on playerctl.
 - **Width-aware centering** with full CJK/wide-character support.
@@ -90,6 +93,7 @@ All config lives in `~/.config/glassy-lyrics/`.
 | `GLASSY_LYRICS_FALLBACK` | `1` | `0` disables the syncedlyrics fallback |
 | `GLASSY_LYRICS_HEIGHT` | `8` | Big-text height in terminal rows |
 | `GLASSY_LYRICS_DEBUG` | — | `1` keeps stderr visible (default: silenced to `/dev/null`) |
+| `GLASSY_LYRICS_BOIDU_KEY` | — | Optional X-API-Key for the Better Lyrics API (uncached tracks / rate-limit bypass) |
 
 ### Per-song offsets — `offsets.json`
 
@@ -124,6 +128,13 @@ echo "YOUR_SP_DC_VALUE" > ~/.config/glassy-lyrics/sp_dc
 > late 2025. If your `sp_dc` gets rejected, the tool automatically falls
 > back to the other sources — nothing breaks.
 
+### Word/syllable-level via Better Lyrics (default, no setup)
+
+If a track is in the Better Lyrics cache, glassy-lyrics shows real
+word/syllable-level karaoke timing (the same TTML data Spicy Lyrics uses).
+No configuration needed — it just works. Uncached/obscure tracks fall back
+to line-level LRCLIB.
+
 ## 🧠 How it works
 
 1. A background thread polls `playerctl` every 0.5 s and extrapolates the
@@ -140,7 +151,12 @@ echo "YOUR_SP_DC_VALUE" > ~/.config/glassy-lyrics/sp_dc
 - **"No track playing"** — is Spotify running and `playerctl -p spotify status`
   showing `Playing`? Other players can be targeted with `GLASSY_LYRICS_PLAYER`.
 - **No lyrics shown** — try a well-known track; add a local LRC override or
-  install `syncedlyrics` for the Musixmatch/NetEase fallback.
+  install `syncedlyrics` for the Musixmatch/NetEase fallback. Popular tracks
+  get word-level karaoke via Better Lyrics; niche tracks usually only have
+  line-level LRCLIB.
+- **Lyrics drift / feel late** — per-track fix via `offsets.json`, or globally
+  with `GLASSY_LYRICS_OFFSET`. Make sure no other app is fighting over
+  playerctl (`playerctl -p spotify status` should say Playing).
 - **Plain text instead of big block letters** — no compatible font found;
   install a bold font (Noto CJK / DejaVu), see the list at the top of the file.
 
