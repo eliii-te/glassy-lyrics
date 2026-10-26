@@ -48,7 +48,7 @@ LRC_OVERRIDE_DIR = os.path.join(CONFIG_DIR, "lrc")
 
 VERSION = "1.7.0"
 
-PLAYER = os.environ.get("GLASSY_LYRICS_PLAYER", "spotify")
+PLAYER = os.environ.get("GLASSY_LYRICS_PLAYER", "brave")
 OFFSET = float(os.environ.get("GLASSY_LYRICS_OFFSET", "0.0"))
 
 HELP_TEXT = f"""glassy-lyrics {VERSION} — synced Spotify lyrics as big terminal text
@@ -88,6 +88,7 @@ CLEAR = RESET_ATTR + "\033[2J\033[H"
 
 PIL_FONTS_BOLD = [
     # Arch / Noto CJK
+    "/usr/share/fonts/google-noto/NotoSans-CondensedBlack.ttf",
     "/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc",
     "/usr/share/fonts/noto-cjk/NotoSansCJK-Black.ttc",
     # Debian/Ubuntu Noto CJK
@@ -110,6 +111,130 @@ PIL_FONTS_BOLD = [
 # Pillow → block-art renderer
 # ──────────────────────────────────────────
 
+
+def _glassy_log(exc):
+    try:
+        import os, traceback
+        p = os.path.expanduser("~/.cache/glassy-lyrics-patch.log")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "a") as f:
+            f.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+    except Exception:
+        pass
+
+def _glassy_cell_k():
+    import os, struct, fcntl, termios
+    env = os.environ.get("GLASSY_CELL_ASPECT")
+    if env:
+        try:
+            return float(env)
+        except ValueError:
+            pass
+    for fd in (1, 0, 2):
+        try:
+            r, c, xp, yp = struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8))
+            if r and c and xp and yp:
+                return min(1.3, max(0.8, (yp / r) / (2 * (xp / c))))
+        except Exception:
+            continue
+    return 1.0
+
+_GLASSY_DEFAULT_BLOCKS = "quad"
+
+def _glassy_blocks_hq(text, font_path, rows, max_cols, k, mode="half", ss=8, thr=0.5):
+    from PIL import Image, ImageDraw, ImageFont
+    box = getattr(Image, "Resampling", Image).BOX
+    quad = (mode == "quad")
+    target_px = max(2, rows * 2)
+    S = target_px * ss
+    f0 = ImageFont.truetype(font_path, S)
+    cap0 = max(1, -f0.getbbox("H", anchor="ls")[1])
+    font = ImageFont.truetype(font_path, max(8, round(S * S / cap0)))
+    cap = max(1, -font.getbbox("H", anchor="ls")[1])
+    l, t, r, b = font.getbbox(text, anchor="ls")
+    pad = ss * 2
+    top_ext = max(cap, -t)
+    im = Image.new("L", ((r - l) + 2 * pad, top_ext + max(0, b) + 2 * pad), 0)
+    base = pad + top_ext
+    ImageDraw.Draw(im).text((pad - l, base), text, font=font, fill=255, anchor="ls")
+    ink = im.getbbox()
+    if not ink:
+        return [""] * rows
+    top = base - cap
+    if ink[1] < top - cap * 0.12:
+        top = ink[1]
+    bottom = base
+    if ink[3] > base + cap * 0.12:
+        bottom = ink[3]
+    im = im.crop((ink[0], max(0, top), ink[2], bottom))
+    w, h = im.size
+    f = target_px / cap
+    sw = max(1, round(w * f * (2 * k if quad else k)))
+    sh = max(2, round(h * f))
+    limit = max_cols * (2 if quad else 1) if max_cols else 0
+    if limit and sw > limit:
+        sh = max(2, round(sh * limit / sw))
+        sw = limit
+    if quad and sw % 2:
+        sw += 1
+    if sh % 2:
+        sh += 1
+    px = im.resize((sw, sh), box).load()
+    on = lambda x, y: px[x, y] / 255 >= thr
+    out = []
+    if quad:
+        q = " ▘▝▀▖▌▞▛▗▚▐▜▄▙▟█"
+        for y in range(0, sh, 2):
+            out.append("".join(
+                q[on(x, y) + 2 * on(x + 1, y) + 4 * on(x, y + 1) + 8 * on(x + 1, y + 1)]
+                for x in range(0, sw, 2)).rstrip())
+    else:
+        for y in range(0, sh, 2):
+            line = []
+            for x in range(sw):
+                u, d = on(x, y), on(x, y + 1)
+                line.append("█" if u and d else "▀" if u else "▄" if d else " ")
+            out.append("".join(line).rstrip())
+    return out
+
+def _glassy_render_patched(self, legacy, args, kwargs, ref):
+    import inspect, os, shutil
+    if isinstance(ref, str):
+        lines, kind = ref.split("\n"), "s"
+    elif isinstance(ref, (list, tuple)) and all(isinstance(x, str) for x in ref):
+        lines, kind = list(ref), "l" if isinstance(ref, list) else "t"
+    else:
+        return ref
+    if any("\x1b" in x for x in lines):
+        return ref
+    ba = inspect.signature(legacy).bind(*args, **kwargs)
+    ba.apply_defaults()
+    bound = ba.arguments
+    text = bound.get("text")
+    if not isinstance(text, str):
+        text = next((v for v in bound.values() if isinstance(v, str)), None)
+    if not text or not text.strip() or lines == [text]:
+        return ref
+    font = getattr(self, "font_path", None)
+    if not (isinstance(font, str) and os.path.exists(font)):
+        font = "/usr/share/fonts/google-noto/NotoSans-CondensedBlack.ttf"
+        if not os.path.exists(font):
+            return ref
+    rows = bound.get("target_rows")
+    if not isinstance(rows, int) or rows < 1:
+        rows = len(lines)
+    mode = os.environ.get("GLASSY_BLOCKS", _GLASSY_DEFAULT_BLOCKS)
+    if mode not in ("half", "quad"):
+        mode = _GLASSY_DEFAULT_BLOCKS
+    maxc = shutil.get_terminal_size((100, 30)).columns - 4
+    out = _glassy_blocks_hq(" ".join(text.split()), font, rows, maxc, _glassy_cell_k(), mode)
+    wmax = max((len(x) for x in out), default=0)
+    out = ["  " + x.ljust(wmax) for x in out]  # filas del mismo ancho: el marco no las desplaza
+    return "\n".join(out) if kind == "s" else (out if kind == "l" else tuple(out))
+
+
+
+
 class BlockRenderer:
     def __init__(self):
         self.font_path = None
@@ -125,7 +250,15 @@ class BlockRenderer:
             self._font_cache[size] = ImageFont.truetype(self.font_path, size)
         return self._font_cache[size]
 
-    def render(self, text, target_rows=8):
+    def render(self, *args, **kwargs):
+        ref = self._render_legacy(*args, **kwargs)
+        try:
+            return _glassy_render_patched(self, self._render_legacy, args, kwargs, ref)
+        except Exception as exc:
+            _glassy_log(exc)
+            return ref
+
+    def _render_legacy(self, text, target_rows=8):
         if not text or not self.font_path or not HAVE_PIL:
             return [text]
         key = (text, target_rows)
@@ -826,10 +959,13 @@ def find_word(lines, position, extra_offset=0.0):
     words = line_text.split()
     if not words:
         return line_text, "", idx
-    line_dur = max(0.4, line_end - line_start)
     elapsed = max(0.0, pos - line_start)
     weights = [max(1, len(w)) for w in words]
     total = sum(weights)
+    # Solo se canta una parte del hueco hasta la siguiente línea: el reparto usa
+    # lo que dura cantarla (letras x ritmo), no la pausa instrumental que sigue.
+    _pace = float(os.environ.get("GLASSY_LYRICS_PACE", "0.12"))  # segundos por letra (conservador)
+    line_dur = max(0.4, min(line_end - line_start, max(1.0, total * _pace)))
     char_budget = elapsed * (total / line_dur)
     cumulative = 0
     word_idx = len(words) - 1
@@ -1067,6 +1203,271 @@ def _silence_stderr():
         pass
 
 
+_MUSIC_TEXT = os.environ.get("GLASSY_LYRICS_MUSIC_TEXT", "(MUSIC)")  # vacío = desactivado
+_MUSIC_DELAY = float(os.environ.get("GLASSY_LYRICS_MUSIC_DELAY", "1.2"))  # s sin palabra antes de mostrarlo
+_music_since = [None]
+
+
+def _glassy_music_word(word):
+    """Si lleva un rato sin haber palabra (intro, pausa instrumental), muestra el texto de música."""
+    if word or not _MUSIC_TEXT:
+        _music_since[0] = None
+        return word
+    now = time.monotonic()
+    if _music_since[0] is None:
+        _music_since[0] = now
+    return _MUSIC_TEXT if now - _music_since[0] >= _MUSIC_DELAY else word
+
+
+# ── Diseño moderno (GLASSY_STYLE=classic vuelve al original) ──────────────
+def _hex_rgb(h, default):
+    try:
+        h = h.strip().lstrip("#")
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    except Exception:
+        return default
+
+
+_ACCENT = _hex_rgb(os.environ.get("GLASSY_ACCENT", "c4b5fd"), (196, 181, 253))
+_GRAY_SUNG = (125, 132, 152)
+_GRAY_NEXT = (205, 210, 226)
+_GRAY_DIM = (98, 104, 124)
+
+
+def _fg(c, bold=False):
+    return ("\033[1m" if bold else "\033[22m") + "\033[38;2;%d;%d;%dm" % tuple(c)
+
+
+def _mix(a, b, t):
+    return tuple(int(a[i] + (b[i] - a[i]) * t + 0.5) for i in range(3))
+
+
+def _vw(s):
+    import unicodedata
+    n = 0
+    for ch in s:
+        if unicodedata.combining(ch):
+            continue
+        n += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return n
+
+
+def _vcut(s, w):
+    if _vw(s) <= w:
+        return s
+    out, n = "", 0
+    for ch in s:
+        cw = _vw(ch)
+        if n + cw > w - 1:
+            break
+        out += ch
+        n += cw
+    return out + "…"
+
+
+def _cpad(ansi, vis, w):
+    return " " * max(0, (w - vis) // 2) + ansi
+
+
+class StyledFrame:
+    def __init__(self, big):
+        self.big = big
+        self.meta = None      # (titulo, posición, duración)
+        self.ctx = None       # (letras, índice de línea)
+        self.last_size = (0, 0)
+        self.rows = {}
+        self._gcache = {}
+        self._li, self._wi, self._lw = None, -1, None
+        self.broken = False
+        self._classic = Frame(big)
+
+    def _big_block(self, word, w):
+        key = (word, w)
+        hit = self._gcache.get(key)
+        if hit is not None:
+            return hit
+        lines = self.big.lines(word, w) if word else []
+        n = len(lines)
+        out = []
+        for i, ln in enumerate(lines):
+            t = i / (n - 1) if n > 1 else 0.0
+            out.append(_fg(_mix((255, 255, 255), _ACCENT, t), True) + center_pad(ln, w) + RESET)
+        if len(self._gcache) > 300:
+            self._gcache.clear()
+        self._gcache[key] = out
+        return out
+
+    def _eq(self, w, rows):
+        import math
+        t = time.monotonic() * 6.0
+        n = max(8, min(28, (w - 8) // 2))
+        vals = []
+        for i in range(n):
+            v = (math.sin(t * 0.9 + i * 0.55) + math.sin(t * 0.53 + i * 1.37) + 2.0) / 4.0
+            vals.append(max(1, int(v * rows * 8)))
+        out = []
+        for r in range(rows - 1, -1, -1):
+            col = _mix(_ACCENT, (255, 255, 255), r / max(1, rows - 1))
+            cells = " ".join(" ▁▂▃▄▅▆▇█"[min(8, max(0, v - 8 * r))] for v in vals)
+            out.append(_cpad(_fg(col) + cells + RESET, 2 * n - 1, w))
+        return out
+
+    @staticmethod
+    def _norm(x):
+        return re.sub(r"[^\w'’-]", "", x, flags=re.UNICODE).upper()
+
+    def _cur_index(self, idx, line, word):
+        if idx != self._li:
+            self._li, self._wi, self._lw = idx, -1, None
+        if word != self._lw:
+            ws = [self._norm(x) for x in line.split()]
+            tgt = (word or "").upper()
+            nxt = -1
+            if tgt:
+                for i in range(self._wi + 1, len(ws)):
+                    if ws[i] == tgt:
+                        nxt = i
+                        break
+                if nxt < 0:
+                    for i, x in enumerate(ws):
+                        if x == tgt:
+                            nxt = i
+                            break
+            if nxt >= 0:
+                self._wi = nxt
+            self._lw = word
+        return self._wi
+
+    def _dim_line(self, text, w):
+        t = _vcut(" ".join(text.split()), max(10, w - 8))
+        return _cpad(_fg(_GRAY_DIM) + t + RESET, _vw(t), w)
+
+    def _cur_line(self, line, wi, w):
+        ws = line.split()
+        if not ws:
+            return ""
+        maxw = max(10, w - 10)
+        lo = hi = max(0, min(wi, len(ws) - 1))
+        width = _vw(ws[lo])
+        while True:
+            grew = False
+            if hi + 1 < len(ws) and width + 1 + _vw(ws[hi + 1]) <= maxw:
+                hi += 1
+                width += 1 + _vw(ws[hi])
+                grew = True
+            if lo > 0 and width + 1 + _vw(ws[lo - 1]) <= maxw:
+                lo -= 1
+                width += 1 + _vw(ws[lo])
+                grew = True
+            if not grew:
+                break
+        parts = []
+        for i in range(lo, hi + 1):
+            if wi < 0 or i > wi:
+                col, b = _GRAY_NEXT, False
+            elif i == wi:
+                col, b = (255, 255, 255), True
+            else:
+                col, b = _GRAY_SUNG, False
+            parts.append(_fg(col, b) + ws[i])
+        txt = " ".join(parts)
+        vis = width
+        if lo > 0:
+            txt = _fg(_GRAY_DIM) + "… " + txt
+            vis += 2
+        if hi < len(ws) - 1:
+            txt += _fg(_GRAY_DIM) + " …"
+            vis += 2
+        return _cpad(txt + RESET, vis, w)
+
+    def _compose(self, word, footer, w, h):
+        rows = {}
+        B = BIG_HEIGHT_ROWS + 2
+        avail = h - 3
+        ctxn = 5 if avail >= B + 6 else (1 if avail >= B + 2 else 0)
+        used = B + ((1 + ctxn) if ctxn else 0)
+        top = 2 + max(0, (avail - used) // 2)
+        mt = globals().get("_MUSIC_TEXT", "(MUSIC)")
+        music = bool(mt) and word == mt
+        lyr, idx = self.ctx if self.ctx else (None, -1)
+        limit = h - 2
+        blk = self._eq(w, max(2, min(6, B - 2))) if music else self._big_block(word, w)
+        off = max(0, (B - len(blk)) // 2)
+        for i, s in enumerate(blk):
+            if top + off + i <= limit:
+                rows[top + off + i] = s
+        if music:
+            cr = top + off + len(blk) + 1   # subtítulo "(MUSIC)" bajo el ecualizador
+            if cr <= limit:
+                rows[cr] = _cpad(_fg(_ACCENT) + mt + RESET, _vw(mt), w)
+        if ctxn and lyr:
+            base = top + B + 1
+            mid = base + (2 if ctxn == 5 else 0)
+
+            def txt(i):
+                return lyr[i][1] if 0 <= i < len(lyr) and len(lyr[i]) > 1 else ""
+
+            if music:
+                nx = next((lyr[j][1] for j in range(max(idx, -1) + 1, len(lyr))
+                           if len(lyr[j]) > 1 and lyr[j][1].strip()), "")
+                if nx:
+                    rows[mid] = self._dim_line(nx, w)
+            else:
+                cur = txt(idx)
+                wi = self._cur_index(idx, cur, word)
+                if cur.strip():
+                    rows[mid] = self._cur_line(cur, wi, w)
+                if ctxn == 5:
+                    if txt(idx - 1).strip():
+                        rows[base] = self._dim_line(txt(idx - 1), w)
+                    if txt(idx + 1).strip():
+                        rows[base + 4] = self._dim_line(txt(idx + 1), w)
+        if self.meta:
+            label, pos, dur = self.meta
+            bw = max(10, min(w - 16, 64))
+            frac = max(0.0, min(1.0, pos / dur)) if dur else 0.0
+            done = int(frac * bw)
+            tl, tr = fmt_time(pos), fmt_time(dur)
+            bar = (_fg(_GRAY_SUNG) + tl + " " + _fg(_ACCENT) + "━" * done +
+                   _fg(_GRAY_DIM) + "─" * (bw - done) + _fg(_GRAY_SUNG) + " " + tr + RESET)
+            rows[h - 1] = _cpad(bar, len(tl) + len(tr) + bw + 2, w)
+            lab = _vcut(label, max(10, w - 8))
+            rows[h] = _cpad(_fg(_GRAY_SUNG) + lab + RESET, _vw(lab), w)
+        else:
+            rows[h] = DIM + center_pad(truncate_vis(footer, w - 4), w) + RESET
+        return rows
+
+    def render(self, word, footer, term_w, term_h):
+        if self.broken:
+            return self._classic.render(word, footer, term_w, term_h)
+        out = []
+        if (term_w, term_h) != self.last_size:
+            out.append(CLEAR)
+            self.last_size = (term_w, term_h)
+            self.rows = {}
+        try:
+            rows = self._compose(word, footer, term_w, term_h)
+        except Exception:
+            self.broken = True
+            return self._classic.render(word, footer, term_w, term_h)
+        for r in sorted(set(self.rows) | set(rows)):
+            new = rows.get(r)
+            if new == self.rows.get(r):
+                continue
+            out.append("\033[%d;1H%s%s%s" % (r, ERASE_LINE, new or "", RESET if new else ""))
+        self.rows = rows
+        if out:
+            out.append(HOME)
+            sys.stdout.write("".join(out))
+            sys.stdout.flush()
+
+
+def _glassy_make_frame(big):
+    if os.environ.get("GLASSY_STYLE", "modern").lower() == "classic":
+        return Frame(big)
+    return StyledFrame(big)
+
+
 def main():
     args = sys.argv[1:]
     if "--version" in args or "-V" in args:
@@ -1086,7 +1487,7 @@ def main():
     spotify = SpotifyLyrics()
     cache = LyricsCache(spotify)
     big = BigWord()
-    frame = Frame(big)
+    frame = _glassy_make_frame(big)
 
     last_track_id = None
     last_lyrics_state = None
@@ -1098,6 +1499,7 @@ def main():
             term = shutil.get_terminal_size((80, 24))
             tw, th = term.columns, term.lines
             track = state.current()
+            frame.meta = frame.ctx = None
 
             if not track:
                 frame.render("",
@@ -1130,12 +1532,14 @@ def main():
                 frame.render("", footer, tw, th)
             elif status == "missing":
                 footer = f"{track_label}    No synced lyrics found    {bar}  {time_part}"
-                frame.render("", footer, tw, th)
+                frame.render(_MUSIC_TEXT, footer, tw, th)
             else:
-                _, word, _ = find_word(lyrics, track["position"], extra_offset=song_offset)
+                _ltxt, word, _widx = find_word(lyrics, track["position"], extra_offset=song_offset)
+                frame.ctx = (lyrics, _widx)
+                frame.meta = (track_label, track["position"], track["duration"])
                 offset_marker = f"  Δ{song_offset:+.1f}s" if song_offset else ""
                 footer = f"{track_label}    {bar}  {time_part}{offset_marker}"
-                frame.render(word, footer, tw, th)
+                frame.render(_glassy_music_word(word), footer, tw, th)
 
             time.sleep(1.0 / RENDER_HZ)
     finally:
